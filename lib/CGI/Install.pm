@@ -1,0 +1,454 @@
+package CGI::Install;
+
+=pod
+
+=head1 NAME
+
+CGI::Install - Installer for CGI applications
+
+=head1 DESCRIPTION
+
+B<CGI::Install> is a package for installing CGI applications.
+
+It is based on the principle that a particular application may need to
+be installed multiple times on a single host.
+
+So an application can be installed normally onto the system, and from
+there the functionality provided by B<CGI::Install> creates a way to
+
+quickly, easily and safely move a copy of that application (or at least
+the parts that matter) from the default system install location to
+the specific CGI directory.
+
+=head2 Intended for CGI Application Authors
+
+The API described below is primarily for the benefit of CGI application
+authors.
+
+End-users looking to actually install the applications should be using
+the L<cgiinstall> command line tool.
+
+=head1 METHODS
+
+=cut
+
+use 5.005;
+use strict;
+use Carp           ();
+use File::Spec     ();
+use File::Copy     ();
+use File::Path     ();
+use File::chmod    ();
+use File::Which    ();
+use File::Remove   ();
+use File::Basename ();
+use Scalar::Util   ();
+use Params::Util   qw{ _STRING _CLASS _INSTANCE };
+use Term::Prompt   ();
+use URI::ToDisk    ();
+use LWP::Simple    ();
+use CGI::Capture   ();
+
+use vars qw{$VERSION $CGICAPTURE};
+BEGIN {
+	$VERSION = '0.02';
+
+	# Locate the cgicapture application
+	$CGICAPTURE ||= File::Which::which('cgicapture');
+	unless ( $CGICAPTURE and -f $CGICAPTURE ) {
+		Carp::croak("Failed to locate the 'cgicapture' application");
+	}
+}
+
+use Object::Tiny qw{
+	force
+	interactive
+	install_cgi
+	install_static
+	cgi_path
+	cgi_uri
+	cgi_capture
+	static_path
+	static_uri
+	errstr
+};
+
+
+
+
+
+
+#####################################################################
+# Constructor and Accessors
+
+sub new {
+	my $self = shift->SUPER::new(@_);
+
+	# Create the arrays for scripts and libraries
+	$self->{bin}   = [];
+	$self->{class} = [];
+
+	# By default, install CGI but not static
+	unless ( defined $self->install_cgi ) {
+		$self->{install_cgi} = 1;
+	}
+	unless ( defined $self->install_static ) {
+		$self->{install_static} = 0;
+	}
+	
+	# Auto-detect interactive mode if needed
+	unless ( defined $self->interactive ) {
+		$self->{interactive} = $self->_is_interactive;
+	}
+
+	# Normalize the boolean flags
+	$self->{force}          = !! $self->{force};
+	$self->{interactive}    = !! $self->{interactive};
+	$self->{install_cgi}    = !! $self->{install_cgi};
+	$self->{install_static} = !! $self->{install_static};
+
+	# Delete params that should not have been provided
+	unless ( $self->install_cgi ) {
+		delete $self->{cgi_uri};
+		delete $self->{cgi_path};
+	}
+	unless ( $self->install_static ) {
+		delete $self->{static_uri};
+		delete $self->{static_path};
+	}
+
+	return $self;
+}
+
+sub prepare {
+	my $self = shift;
+
+	# Check the cgi params if installing CGI
+	if ( $self->install_cgi ) {
+		# Get and check the base cgi path
+		if ( $self->interactive and ! defined $self->cgi_path ) {
+			$self->{cgi_path} = Term::Prompt::prompt(
+				'x', 'CGI Directory:', '',
+				File::Spec->rel2abs( File::Spec->curdir ),
+			);
+		}
+		my $cgi_path = $self->cgi_path;
+		unless ( defined $cgi_path ) {
+			return $self->prepare_error("No cgi_path provided");
+		}
+		unless ( -d $cgi_path ) {	
+			return $self->prepare_error("The cgi_path '$cgi_path' does not exist");
+		}
+		unless ( -w $cgi_path ) {
+			return $self->prepare_error("The cgi_path '$cgi_path' is not writable");
+		}
+
+		# Get and check the cgi_uri
+		if ( $self->interactive and ! defined $self->cgi_uri ) {
+			$self->{cgi_uri} = Term::Prompt::prompt(
+				'x', 'CGI URI:', '', '',
+			);
+		}
+		unless ( defined _STRING($self->cgi_uri) ) {
+			return $self->prepare_error("No cgi_path provided");
+		}
+
+		# Validate the CGI settings
+		unless ( $self->force or $self->validate_cgi_dir($self->cgi_map) ) {
+			return $self->prepare_error("CGI mapping failed testing");
+		}
+	}
+
+	# Check the static params if installing static
+	if ( $self->install_static ) {
+		# Get and check the base cgi path
+		if ( $self->interactive and ! defined $self->static_path ) {
+			$self->{static_path} = Term::Prompt::prompt(
+				'x', 'Static Directory:', '',
+				File::Spec->rel2abs( File::Spec->curdir ),
+			);
+		}
+		my $static_path = $self->static_path;
+		unless ( defined $static_path ) {
+			return $self->prepare_error("No static_path provided");
+		}
+		unless ( -d $static_path ) {	
+			return $self->prepare_error("The static_path '$static_path' does not exist");
+		}
+		unless ( -w $static_path ) {
+			return $self->prepare_error("The static_path '$static_path' is not writable");
+		}
+
+		# Get and check the cgi_uri
+		if ( $self->interactive and ! defined $self->static_uri ) {
+			$self->{static_uri} = Term::Prompt::prompt(
+				'x', 'Static URI:', '', '',
+			);
+		}
+		unless ( defined _STRING($self->static_uri) ) {
+			return $self->prepare_error("No static_path provided");
+		}
+
+		# Validate the CGI settings
+		unless ( $self->force or $self->validate_static_dir($self->static_map) ) {
+			return $self->prepare_error("Static mapping failed testing");
+		}
+	}
+
+	return 1;
+}
+
+sub run {
+	my $self = shift;
+
+	# Install any binary files
+	foreach my $bin ( @{$self->{bin}} ) {
+		my $from = File::Which::which($bin)
+			or die "Unexpectedly failed to find '$bin'";
+		my $to = $self->cgi_map->catfile($bin)->path;
+		File::Copy::copy( $from => $to );
+		unless ( -f $to ) {
+			die "Unexpectedly failed to create '$to'";
+		}
+	}
+
+	# Install any class files
+	foreach my $class ( @{$self->{class}} ) {
+		my $from = $self->_module_path($class);
+		my $to   = File::Spec->catfile(
+			$self->cgi_map->catdir('lib')->path,
+			File::Spec->catfile(split /::/, $class) . '.pm',
+		);
+		my $dirname = File::Basename::dirname($to);
+		File::Path::mkpath( $dirname, 0, 0755 );
+		unless ( -d $dirname ) {
+			die "Failed to create directory '$dirname'";
+		}
+		File::Copy::copy( $from => $to );
+		unless ( -f $to ) {
+			die "Unexpectedly failed to create '$to'";
+		}
+	}
+
+	return 1;
+}
+
+
+
+
+
+#####################################################################
+# Accessor-Derived Methods
+
+sub cgi_map {
+	$_[0]->install_cgi or return undef;
+	URI::ToDisk->new( $_[0]->cgi_path => $_[0]->cgi_uri );
+}
+
+sub static_map {
+	$_[0]->install_static or return undef;
+	URI::ToDisk->new( $_[0]->static_path => $_[0]->static_uri );
+}
+
+
+
+
+
+#####################################################################
+# Manipulation
+
+sub add_bin {
+	my $self = shift;
+	my $bin  = _STRING(shift) or die "Invalid bin name";
+	File::Which::which($bin)  or die "Failed to find '$bin'";
+	push @{$self->{bin}}, $bin;
+	return 1;
+}
+
+sub add_class {
+	my $self  = shift;
+	my $class = _CLASS(shift)     or die "Invalid class name";
+	$self->_module_exists($class) or die "Failed to find '$class'";
+	push @{$self->{class}}, $class;
+	return 1;
+}
+
+
+
+
+
+#####################################################################
+# Functional Methods
+
+sub validate_cgi_dir {
+	my $self = shift;
+	my $dir  = _INSTANCE(shift, 'URI::ToDisk')
+		or Carp::croak("Did not pass a URI::ToDisk object to valid_cgi");
+	my $file = $dir->catfile('cgicapture');
+
+	# Copy the cgicapture application to the CGI path
+	unless ( File::Copy::copy( $CGICAPTURE, $file->path ) ) {
+		return undef;
+		# Carp::croak("Failed to copy cgicapture into place");
+	}
+	unless ( File::chmod::chmod('a+rx', $file->path) ) {
+		return undef;
+		# Carp::croak("Failed to set executable permissions");
+	}
+
+	# Call the URI
+	my $www = LWP::Simple::get( $file->URI );
+
+	# Clean up the file now, before we check for errors
+	File::Remove::remove( $file->path );
+
+	# Continue and check for errors
+	unless ( defined $www ) {
+		return undef;
+		# Carp::croak("Nothing returned from the cgicapture web request");
+	}
+	if ( $www =~ /^\#\!\/usr\/bin\/perl/ ) {
+		return undef;
+		# Carp::croak("URI is not a CGI path");
+	}
+	unless ( $www =~ /^---\nARGV\:/ ) {
+		return undef;
+		# Carp::croak("Unknown value returned from URI");
+	}
+
+	# Superficially ok, convert to capture object
+	$self->{cgi_capture} = CGI::Capture->from_yaml_string($www);
+	unless ( _INSTANCE($self->{cgi_capture}, 'CGI::Capture') ) {
+		return undef;
+		# Carp::croak("Failed to create capture object");
+	}
+
+	return 1;
+}
+
+sub validate_static_dir {
+	my $self = shift;
+	my $dir  = _INSTANCE(shift, 'URI::ToDisk')
+		or Carp::croak("Did not pass a URI::ToDisk object to valid_static");
+	my $file = $dir->catfile('cgiinstall.txt');
+
+	# Write a test file to the directory
+	my $test_string = int(rand(100000000+1000));
+	open( FILE, '>' . $file->path ) or die "open: $!";
+	print FILE $test_string           or die "print: $!";
+	close FILE                        or die "close: $!";
+
+	# Call the URI
+	my $www = LWP::Simple::get( $file->URI );
+
+	# Clean up the file now, before we check for errors
+	File::Remove::remove( $file->path );
+
+	# Continue and check for errors
+	unless ( defined $www ) {
+		return undef;
+		# Carp::croak("Nothing returned from the cgicapture web request");
+	}
+
+	# Check the result
+	unless ( $www eq $test_string ) {
+		return undef;
+		# Carp::croak("Unknown value returned from URI");
+	}
+
+	return 1;
+}
+
+
+
+
+
+#####################################################################
+# Utility Methods
+
+sub new_error {
+	my $self = shift;
+	$self->{errstr} = _STRING(shift) || 'Unknown error';
+	return;
+}
+
+sub prepare_error {
+	my $self = shift;
+	return _STRING(shift) || 'Unknown error';
+}
+
+# Copied from IO::Interactive
+sub _is_interactive {
+	my $self = shift;
+
+	# Default to default output handle
+	my ($out_handle) = (@_, select);  
+
+	# Not interactive if output is not to terminal...
+	return 0 if not -t $out_handle;
+
+	# If *ARGV is opened, we're interactive if...
+	if ( Scalar::Util::openhandle *ARGV ) {
+		# ...it's currently opened to the magic '-' file
+		return -t *STDIN if defined $ARGV && $ARGV eq '-';
+
+		# ...it's at end-of-file and the next file is the magic '-' file
+		return @ARGV > 0 && $ARGV[0] eq '-' && -t *STDIN if eof *ARGV;
+
+		# ...it's directly attached to the terminal
+		return -t *ARGV;
+	}
+
+	# If *ARGV isn't opened, it will be interactive if *STDIN is attached 
+	# to a terminal and either there are no files specified on the command line
+	# or if there are files and the first is the magic '-' file
+	return -t *STDIN && (@ARGV==0 || $ARGV[0] eq '-');
+}
+
+sub _module_exists {
+	my $self = shift;
+	my $path = $self->_module_path(shift);
+	return !! $path;
+}
+
+sub _module_path {
+	my $self  = shift;
+	my @parts = split /::/, $_[0];
+	my @found =
+		grep { -f $_ }
+		map  { File::Spec->catdir($_, @parts) . '.pm' }
+		grep { -d $_ } @INC;
+	return $found[0];
+}
+
+1;
+
+=pod
+
+=head1 SUPPORT
+
+All bugs should be filed via the bug tracker at
+
+L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=CGI-Install>
+
+For other issues, or commercial enhancement or support, contact the author.
+
+=head1 AUTHORS
+
+Adam Kennedy E<lt>adamk@cpan.orgE<gt>
+
+=head1 SEE ALSO
+
+L<http://ali.as/>, L<CGI::Capture>
+
+=head1 COPYRIGHT
+
+Copyright 2007 Adam Kennedy.
+
+This program is free software; you can redistribute
+it and/or modify it under the same terms as Perl itself.
+
+The full text of the license can be found in the
+LICENSE file included with this module.
+
+=cut
