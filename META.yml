@@ -6,7 +6,6 @@ build_requires:
   Test::More: 0.42
   Test::Script: 1.02
   URI: 1.35
-  URI::file: 0
 distribution_type: module
 generated_by: Module::Install version 0.67
 license: perl
@@ -21,12 +20,13 @@ no_index:
 requires: 
   CGI::Capture: 1.08
   Carp: 0
+  Config: 0
+  ExtUtils::Packlist: 0
   File::Basename: 0
   File::Copy: 0
   File::Path: 0
   File::Remove: 0.36
   File::Spec: 0.80
-  File::Which: 0.05
   File::chmod: 0.31
   LWP::Simple: 1.41
   Object::Tiny: 1.02
@@ -35,4 +35,4 @@ requires:
   Term::Prompt: 1.03
   URI::ToDisk: 1.09
   perl: 5.005
-version: 0.02
+version: 0.04

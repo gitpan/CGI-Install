@@ -34,30 +34,30 @@ the L<cgiinstall> command line tool.
 
 use 5.005;
 use strict;
-use Carp           ();
-use File::Spec     ();
-use File::Copy     ();
-use File::Path     ();
-use File::chmod    ();
-use File::Which    ();
-use File::Remove   ();
-use File::Basename ();
-use Scalar::Util   ();
-use Params::Util   qw{ _STRING _CLASS _INSTANCE };
-use Term::Prompt   ();
-use URI::ToDisk    ();
-use LWP::Simple    ();
-use CGI::Capture   ();
+use Config;
+use Carp               ();
+use File::Spec         ();
+use File::Copy         ();
+use File::Path         ();
+use File::chmod        ();
+use File::Remove       ();
+use File::Basename     ();
+use Scalar::Util       ();
+use Params::Util       qw{ _STRING _CLASS _INSTANCE };
+use Term::Prompt       ();
+use URI::ToDisk        ();
+use LWP::Simple        ();
+use CGI::Capture       ();
+use ExtUtils::Packlist ();
 
 use vars qw{$VERSION $CGICAPTURE};
 BEGIN {
-	$VERSION = '0.02';
+	$VERSION = '0.04';
+}
 
-	# Locate the cgicapture application
-	$CGICAPTURE ||= File::Which::which('cgicapture');
-	unless ( $CGICAPTURE and -f $CGICAPTURE ) {
-		Carp::croak("Failed to locate the 'cgicapture' application");
-	}
+$CGICAPTURE ||= __PACKAGE__->_find_script('CGI::Capture', 'cgicapture');
+unless ( $CGICAPTURE and -f $CGICAPTURE ) {
+	Carp::croak("Failed to locate the 'cgicapture' application");
 }
 
 use Object::Tiny qw{
@@ -85,7 +85,7 @@ sub new {
 	my $self = shift->SUPER::new(@_);
 
 	# Create the arrays for scripts and libraries
-	$self->{bin}   = [];
+	$self->{script}   = [];
 	$self->{class} = [];
 
 	# By default, install CGI but not static
@@ -202,10 +202,12 @@ sub run {
 	my $self = shift;
 
 	# Install any binary files
-	foreach my $bin ( @{$self->{bin}} ) {
-		my $from = File::Which::which($bin)
-			or die "Unexpectedly failed to find '$bin'";
-		my $to = $self->cgi_map->catfile($bin)->path;
+	foreach my $script ( @{$self->{script}} ) {
+		my $from = $script->[2];
+		unless ( $from and -f $from ) {
+			die "Unexpectedly failed to find '$script->[1]'";
+		}
+		my $to = $self->cgi_map->catfile($script->[1])->path;
 		File::Copy::copy( $from => $to );
 		unless ( -f $to ) {
 			die "Unexpectedly failed to create '$to'";
@@ -257,11 +259,15 @@ sub static_map {
 #####################################################################
 # Manipulation
 
-sub add_bin {
-	my $self = shift;
-	my $bin  = _STRING(shift) or die "Invalid bin name";
-	File::Which::which($bin)  or die "Failed to find '$bin'";
-	push @{$self->{bin}}, $bin;
+sub add_script {
+	my $self   = shift;
+	my $class  = _CLASS(shift)  or die "Invalid class name";
+	my $script = _STRING(shift) or die "Invalid script name";
+	my $path   = $self->_find_script($class, $script);
+	unless ( $path and -f $path ) {
+		Carp::croak( "Failed to find '$script'");
+	}
+	push @{$self->{script}}, [ $class, $script, $path ];
 	return 1;
 }
 
@@ -419,6 +425,38 @@ sub _module_path {
 		map  { File::Spec->catdir($_, @parts) . '.pm' }
 		grep { -d $_ } @INC;
 	return $found[0];
+}
+
+sub _find_script {
+	my $either = shift;
+	my $module = shift;
+	my $script = shift;
+	my @dirs   = grep { -e } ( $Config{archlibexp}, $Config{sitearchexp} );
+	my $file   = File::Spec->catfile(
+		'auto', split( /::/, $module), '.packlist',
+		);
+
+	foreach my $dir ( @dirs ) {
+		my $path = File::Spec->catfile( $dir, $file );
+		next unless -f $path;
+
+		# Load the file
+		my $packlist = ExtUtils::Packlist->new($path);
+		unless ( $packlist ) {
+			die "Failed to load .packlist file for $module";
+		}
+
+		my $script_name = quotemeta $script;
+		my @script = sort grep { /\b$script_name$/ } keys %$packlist;
+		if ( @script > 1 ) {
+			die "Unexpectedly found more than one $script file";
+		}
+		if ( @script == 0 ) {
+			die "Failed to find $script script";
+		}
+		return $script[0];
+	}
+	die "Failed to locate .packfile for $module";
 }
 
 1;
